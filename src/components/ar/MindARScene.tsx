@@ -1,17 +1,29 @@
 import { FC, useEffect, useRef, useState, useCallback } from "react";
 
+// Global type declarations for CDN libraries
+declare global {
+  interface Window {
+    MINDAR: {
+      IMAGE: {
+        MindARThree: any;
+        Compiler: any;
+      };
+    };
+    THREE: any;
+  }
+}
+
 interface MindARSceneProps {
   targetImageSrc: string;
   videoSrc: string;
   onTrackingChange: (isTracking: boolean) => void;
 }
 
-declare global {
-  interface Window {
-    MINDAR: any;
-    THREE: any;
-  }
-}
+// Cache for compiled targets and videos
+const arCache = {
+  targets: new Map<string, Blob>(),
+  videos: new Map<string, string>(),
+};
 
 export const MindARScene: FC<MindARSceneProps> = ({
   targetImageSrc,
@@ -26,23 +38,30 @@ export const MindARScene: FC<MindARSceneProps> = ({
   const compilerRef = useRef<any>(null);
   const [mindFileUrl, setMindFileUrl] = useState<string | null>(null);
 
-  // Compile target image to .mind file
+  // Compile target image to .mind file with caching
   const compileTargetImage = useCallback(
     async (imageSrc: string): Promise<string> => {
       console.log("[MindAR] Compiling target image...");
 
+      // Check if CDN is loaded
+      if (typeof window.MINDAR === "undefined") {
+        throw new Error("MindAR CDN not loaded. Please refresh the page.");
+      }
+
+      // Check cache first
+      if (arCache.targets.has(imageSrc)) {
+        console.log("[MindAR] Using cached compiled target");
+        const cachedBlob = arCache.targets.get(imageSrc)!;
+        return URL.createObjectURL(cachedBlob);
+      }
+
       return new Promise((resolve, reject) => {
         try {
-          // Check if compiler is available
-          if (!window.MINDAR?.IMAGE?.Compiler) {
-            reject(new Error("MindAR Compiler not loaded"));
-            return;
-          }
-
-          const compiler = new window.MINDAR.IMAGE.Compiler();
+          // Use MindAR Compiler from CDN
+          const { Compiler } = window.MINDAR.IMAGE;
+          const compiler = new Compiler();
           compilerRef.current = compiler;
 
-          // Load image
           const img = new Image();
           img.crossOrigin = "anonymous";
 
@@ -50,7 +69,6 @@ export const MindARScene: FC<MindARSceneProps> = ({
             try {
               console.log("[MindAR] Image loaded, starting compilation...");
 
-              // Compile the image
               await compiler.compileImageTargets([img], (progress: number) => {
                 console.log(
                   "[MindAR] Compile progress:",
@@ -58,16 +76,16 @@ export const MindARScene: FC<MindARSceneProps> = ({
                 );
               });
 
-              // Export to buffer
               const exportedBuffer = await compiler.exportData();
-
-              // Create blob URL
               const blob = new Blob([exportedBuffer], {
                 type: "application/octet-stream",
               });
-              const url = URL.createObjectURL(blob);
 
-              console.log("[MindAR] Compilation complete!");
+              // Cache the compiled target
+              arCache.targets.set(imageSrc, blob);
+
+              const url = URL.createObjectURL(blob);
+              console.log("[MindAR] Compilation complete and cached!");
               resolve(url);
             } catch (err) {
               console.error("[MindAR] Compilation error:", err);
@@ -91,15 +109,24 @@ export const MindARScene: FC<MindARSceneProps> = ({
   // Initialize MindAR
   const initAR = useCallback(
     async (mindFileUrl: string) => {
-      if (!containerRef.current || !window.THREE) return;
+      if (!containerRef.current) return;
 
       try {
         console.log("[MindAR] Initializing AR scene...");
 
+        // Check if CDN libraries are loaded
+        if (typeof window.MINDAR === "undefined") {
+          throw new Error("MindAR CDN not loaded. Please refresh the page.");
+        }
+
+        if (typeof window.THREE === "undefined") {
+          throw new Error("Three.js CDN not loaded. Please refresh the page.");
+        }
+
+        // Use MindARThree and THREE from CDN
         const { MindARThree } = window.MINDAR.IMAGE;
         const THREE = window.THREE;
 
-        // Initialize MindAR
         const mindarThree = new MindARThree({
           container: containerRef.current,
           imageTargetSrc: mindFileUrl,
@@ -111,6 +138,10 @@ export const MindARScene: FC<MindARSceneProps> = ({
         mindarRef.current = mindarThree;
 
         const { renderer, scene, camera } = mindarThree;
+
+        // Add lighting
+        const light = new THREE.HemisphereLight(0xffffff, 0xbbbbff, 1);
+        scene.add(light);
 
         // Create video texture
         if (arVideoRef.current) {
@@ -163,99 +194,46 @@ export const MindARScene: FC<MindARSceneProps> = ({
         });
       } catch (err) {
         console.error("[MindAR] Initialization error:", err);
-        setError("Failed to initialize AR. Please try again.");
+        setError(
+          err instanceof Error
+            ? err.message
+            : "Failed to initialize AR. Please try again."
+        );
       }
     },
     [onTrackingChange]
   );
 
-  // Load scripts and initialize
+  // Load and initialize
   useEffect(() => {
     let mounted = true;
 
     const loadAndInit = async () => {
       try {
-        // Load Three.js from UNPKG (UMD version)
-        if (!window.THREE) {
-          console.log("[MindAR] Loading Three.js...");
-          await new Promise<void>((resolve, reject) => {
-            const script = document.createElement("script");
-            script.src = "https://unpkg.com/three@0.136.0/build/three.js";
-            script.type = "text/javascript";
-            script.onload = () => {
-              console.log("[MindAR] Three.js loaded");
-              resolve();
-            };
-            script.onerror = (e) => {
-              console.error("[MindAR] Failed to load Three.js:", e);
-              reject(e);
-            };
-            document.head.appendChild(script);
-          });
+        console.log("[MindAR] Starting initialization...");
+
+        // Wait for CDN to load (with timeout)
+        const maxWaitTime = 5000;
+        const startTime = Date.now();
+
+        while (
+          (typeof window.MINDAR === "undefined" ||
+            typeof window.THREE === "undefined") &&
+          Date.now() - startTime < maxWaitTime
+        ) {
+          await new Promise((resolve) => setTimeout(resolve, 100));
         }
 
-        // Load MindAR Image Compiler from UNPKG
-        if (!window.MINDAR?.IMAGE?.Compiler) {
-          console.log("[MindAR] Loading MindAR Compiler...");
-          await new Promise<void>((resolve, reject) => {
-            const script = document.createElement("script");
-            script.src =
-              "https://cdn.jsdelivr.net/npm/mind-ar@1.2.2/dist/mindar-image.prod.js";
-            script.type = "text/javascript";
-            script.onload = () => {
-              console.log("[MindAR] Compiler loaded");
-              // Wait a bit for the module to initialize
-              setTimeout(resolve, 200);
-            };
-            script.onerror = (e) => {
-              console.error("[MindAR] Failed to load Compiler:", e);
-              reject(e);
-            };
-            document.head.appendChild(script);
-          });
+        if (
+          typeof window.MINDAR === "undefined" ||
+          typeof window.THREE === "undefined"
+        ) {
+          throw new Error(
+            "Failed to load AR libraries. Please refresh the page."
+          );
         }
-
-        // Load MindAR Three from UNPKG
-        if (!window.MINDAR?.IMAGE?.MindARThree) {
-          console.log("[MindAR] Loading MindAR Three...");
-          await new Promise<void>((resolve, reject) => {
-            const script = document.createElement("script");
-            script.src =
-              "https://cdn.jsdelivr.net/npm/mind-ar@1.2.2/dist/mindar-image-three.prod.js";
-            script.type = "text/javascript";
-            script.onload = () => {
-              console.log("[MindAR] MindAR Three loaded");
-              // Wait a bit for the module to initialize
-              setTimeout(resolve, 200);
-            };
-            script.onerror = (e) => {
-              console.error("[MindAR] Failed to load MindAR Three:", e);
-              reject(e);
-            };
-            document.head.appendChild(script);
-          });
-        }
-
-        if (!mounted) return;
-
-        // Wait a bit more to ensure everything is fully initialized
-        await new Promise((resolve) => setTimeout(resolve, 300));
-
-        // Verify all libraries are loaded
-        if (!window.THREE) {
-          throw new Error("Three.js failed to load");
-        }
-        if (!window.MINDAR?.IMAGE?.Compiler) {
-          throw new Error("MindAR Compiler failed to load");
-        }
-        if (!window.MINDAR?.IMAGE?.MindARThree) {
-          throw new Error("MindAR Three failed to load");
-        }
-
-        console.log("[MindAR] All libraries loaded successfully");
 
         // Compile target image
-        console.log("[MindAR] Starting compilation...");
         const url = await compileTargetImage(targetImageSrc);
         if (!mounted) return;
 
@@ -266,7 +244,11 @@ export const MindARScene: FC<MindARSceneProps> = ({
       } catch (err) {
         console.error("[MindAR] Setup error:", err);
         if (mounted) {
-          setError("Failed to setup AR. Please refresh and try again.");
+          setError(
+            err instanceof Error
+              ? err.message
+              : "Failed to setup AR. Please refresh and try again."
+          );
         }
       }
     };
@@ -287,6 +269,14 @@ export const MindARScene: FC<MindARSceneProps> = ({
       }
     };
   }, [targetImageSrc, compileTargetImage, initAR]);
+
+  // Cache video src
+  useEffect(() => {
+    if (!arCache.videos.has(videoSrc)) {
+      arCache.videos.set(videoSrc, videoSrc);
+      console.log("[MindAR] Video cached");
+    }
+  }, [videoSrc]);
 
   return (
     <div className="ar-viewport">
